@@ -295,6 +295,7 @@ extension AntigravityLocalReader {
         var ambiguousBotIDs = Set<String>()
         var isComplete = false
         var rowsAreValid = true
+        var sawUnidentifiedRows = false
         while true {
             try progress.budget.check()
             let step = sqlite3_step(statement)
@@ -331,8 +332,13 @@ extension AntigravityLocalReader {
                 rowsAreValid = false
                 continue
             }
-            guard let stepUUID = parsed.stepUUID, !stepUUID.isEmpty else {
-                rowsAreValid = false
+            // A row without a step UUID (field 12 absent, or blank per `Field.string()`'s
+            // whitespace-only-is-absent rule) carries no identity: it belongs to no UUID's occurrence
+            // list and can never supply or shift positional evidence, so it is skipped rather than
+            // invalidating the scan. While any such row is present, a single step timestamp does not
+            // stand in for every reused generation occurrence of its UUID (see resolveStepTimestamps).
+            guard let stepUUID = parsed.stepUUID else {
+                sawUnidentifiedRows = true
                 continue
             }
             if let botID = parsed.botID {
@@ -361,7 +367,8 @@ extension AntigravityLocalReader {
         })
         let resolved = self.resolveStepTimestamps(
             positionalEntries,
-            neededStepOccurrences: neededStepOccurrences)
+            neededStepOccurrences: neededStepOccurrences,
+            unidentifiedRowsPresent: sawUnidentifiedRows)
         return StepTimestampScan(
             timestamps: resolved,
             byBotID: exactByBotID,
@@ -413,7 +420,8 @@ extension AntigravityLocalReader {
 
     private static func resolveStepTimestamps(
         _ stepTimestamps: [String: [StepTimestamp]],
-        neededStepOccurrences: [String: [StepOccurrence]]) -> [String: [Int64]]
+        neededStepOccurrences: [String: [StepOccurrence]],
+        unidentifiedRowsPresent: Bool) -> [String: [Int64]]
     {
         var resolved: [String: [Int64]] = [:]
         for (stepUUID, timestamps) in stepTimestamps {
@@ -429,7 +437,14 @@ extension AntigravityLocalReader {
             }
             let orderedTimestamps = sorted.map(\.timestampMs)
             let selected: [Int64]
-            if orderedTimestamps.count == 1, let sharedTimestamp = orderedTimestamps[0] {
+            // A lone step timestamp can stand in for every occurrence of a reused UUID only when the
+            // scan accounted for every step row. An unidentified row breaks that guarantee: it could
+            // have been another occurrence of this same UUID whose identity was lost, so treating one
+            // surviving row as authoritative for all of them would risk publishing a false date. A
+            // single-occurrence UUID (neededCount == 1) has nothing to misattribute either way.
+            if orderedTimestamps.count == 1, neededCount == 1 || !unidentifiedRowsPresent,
+               let sharedTimestamp = orderedTimestamps[0]
+            {
                 selected = Array(repeating: sharedTimestamp, count: neededCount)
             } else {
                 guard orderedTimestamps.count >= neededCount else { continue }
